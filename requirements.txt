@@ -1,4 +1,187 @@
-PyQt5
-openai
-xlsxwriter
-requests
+# 核心GUI框架
+PyQt5>=5.15.0
+PyQt5-tools>=5.15.0
+ 
+# HTTP请求和API集成
+requests>=2.28.0
+openai>=1.0.0
+ 
+# 数据处理和分析
+xlsxwriter>=3.0.0
+pandas>=1.5.0
+numpy>=1.21.0
+datasets>=2.0.0
+ 
+# 代码分析和AST处理
+jedi>=0.18.0
+parso>=0.8.0
+
+# 静态分析工具（实际使用的）
+ruff>=0.0.260
+mypy>=1.0.0
+bandit>=1.7.0
+pylint>=2.15.0
+flake8>=5.0.0
+pyflakes>=2.5.0
+
+# 代码格式化
+black>=22.0.0
+autopep8>=2.0.0
+isort>=5.10.0
+
+# 类型检查和提示
+typing-extensions>=4.0.0
+mypy-extensions>=1.0.0
+
+# 配置文件处理
+pyyaml>=6.0
+toml>=0.10.0
+
+# 日志和调试
+colorlog>=6.0.0
+tqdm>=4.64.0
+rich>=12.0.0
+
+# 文件和路径处理
+pathlib2>=2.3.0
+glob2>=0.7.0
+watchdog>=2.1.0
+
+# 字符串和文本处理
+regex>=2022.0.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.20.0
+chardet>=5.0.0
+
+# 进程和系统调用
+psutil>=5.9.0
+
+# 时间处理
+python-dateutil>=2.8.0
+
+# JSON处理增强
+ujson>=5.0.0
+jsonschema>=4.0.0
+
+# 并发处理
+concurrent-futures>=3.1.0
+aiofiles>=0.8.0
+
+# 数据验证和序列化
+pydantic>=1.10.0
+marshmallow>=3.17.0
+
+# 测试框架
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.10.0
+
+# 性能分析
+memory-profiler>=0.60.0
+line-profiler>=4.0.0
+
+# 图像处理（GUI相关）
+Pillow>=9.0.0
+
+# 错误追踪
+better-exceptions>=0.3.0
+
+# 环境管理
+python-dotenv>=0.19.0
+
+# XML和HTML处理（Java相关）
+lxml>=4.9.0
+
+# 系统信息
+distro>=1.7.0
+
+# 加密和安全
+cryptography>=3.4.0
+
+# 版本控制
+GitPython>=3.1.0
+
+# 模板引擎（用于代码生成）
+jinja2>=3.1.0
+
+# 自然语言处理（文本相似度）
+nltk>=3.7.0
+textdistance>=4.2.0
+
+# 代码搜索和比较
+difflib2>=0.1.0
+
+# 网络增强
+httpx>=0.24.0
+urllib3>=1.26.0
+certifi>=2022.0.0
+
+# 开发工具
+click>=8.1.0
+packaging>=21.0.0
+
+# API文档
+fastapi>=0.85.0
+uvicorn>=0.18.0
+
+# 数据清洗
+pyjanitor>=0.23.0
+
+# 时间序列分析（性能监控）
+pytz>=2022.0.0
+
+# 压缩处理
+zipfile36>=0.1.3
+
+# 命令行工具
+docopt>=0.6.0
+
+# 国际化
+babel>=2.10.0
+
+# 数据库（缓存用）
+sqlite-utils>=3.30.0
+
+# 任务调度
+apscheduler>=3.9.0
+
+# 代码复杂度分析
+lizard>=1.17.0
+radon>=5.1.0
+mccabe>=0.7.0
+
+# 数据可视化（报告用）
+matplotlib>=3.6.0
+seaborn>=0.11.0
+plotly>=5.10.0
+
+# API客户端（LLM调用）
+aiohttp>=3.8.0
+
+# 文件监控
+inotify>=0.2.0
+
+# 代码反编译（Python）
+uncompyle6>=3.9.0
+
+# 安全扫描
+semgrep>=1.0.0
+safety>=2.3.0
+
+# 代码审查工具
+vulture>=2.6.0
+xenon>=0.9.0
+
+# 数据迁移
+alembic>=1.8.0
+
+# 缓存系统
+diskcache>=5.4.0
+
+# 配置管理
+hydra-core>=1.2.0
+omegaconf>=2.2.0
+
+# 监控指标
+prometheus-client>=0.15.0

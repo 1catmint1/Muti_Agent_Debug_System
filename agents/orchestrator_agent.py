@@ -104,142 +104,201 @@ class OrchestratorAgent(BaseAgent):
 
         return strategy
 
+        # agents/orchestrator_agent.py
+
     def execute(self, decision: Dict[str, Any]) -> Dict[str, Any]:
-        """执行阶段：协调各Agent执行"""
+        """执行阶段：协调各Agent执行 (带自愈循环 & 结果累积)"""
         workflow = decision.get("workflow", [])
         enable_agents = decision.get("enable_agents", {})
 
-        # 初始化结果
-        pipeline_results = {
-            "scan_results": None,
-            "analysis": None,
-            "fix_results": None,
-            "verification": None,
-            "execution_time": {},
-            "success": False
-        }
+        # 🔥🔥🔥 1. 初始化累积字典：用于跨轮次保存所有文件的最新修复状态
+        # Key: filename, Value: file_result_dict
+        accumulated_fixed_files = {}
+
+        # 配置最大重试次数
+        MAX_RETRIES = 2
 
         files = decision.get("files", [])
-        user_request = decision.get("user_request", "")
-        test_cases = decision.get("test_cases", [])
+        # 使用 current_files 追踪代码的最新状态
+        current_files = files
 
-        try:
-            # 1. 扫描阶段
-            if "scan" in workflow and enable_agents.get("scanner"):
-                self.log(f"\n{'=' * 80}")
-                self.log("🔍 阶段 1/4：代码扫描")
-                self.log("=" * 80)
+        # 结果容器
+        final_pipeline_results = {
+            "success": False,
+            "history": []  # 记录每一轮的结果
+        }
 
-                start_time = time.time()
+        current_analysis = None
+        current_dynamic_feedback = None  # 用于传递给 Fixer
 
-                scan_input = {"files": files}
-                scan_perception = self.scanner.perceive(scan_input)
-                scan_decision = self.scanner.decide(scan_perception)
-                # 合并 files 等数据
-                scan_decision.update(scan_perception)
+        for attempt in range(MAX_RETRIES + 1):  # +1 是因为第0次是正常流程
+            self.log(f"\n{'#' * 80}")
+            if attempt == 0:
+                self.log(f"🔄 执行工作流 (初始轮次)")
+            else:
+                self.log(f"🔄 执行工作流 (重试轮次 {attempt}/{MAX_RETRIES}) - 尝试修复运行时问题")
+            self.log(f"{'#' * 80}")
 
-                scan_results = self.scanner.execute(scan_decision)
+            # 本轮的结果容器
+            round_results = {
+                "round": attempt,
+                "scan_results": None,
+                "fix_results": None,
+                "verification": None
+            }
 
-                pipeline_results["scan_results"] = scan_results
-                pipeline_results["execution_time"]["scan"] = time.time() - start_time
+            try:
+                # 1. 扫描 (仅在第一轮)
+                if "scan" in workflow and enable_agents.get("scanner") and attempt == 0:
+                    self.log(f"\n🔍 阶段 1/4：代码扫描")
+                    # 调用 Scanner
+                    scan_input = {"files": current_files}
+                    self.scanner.perceive(scan_input)
+                    # 执行扫描
+                    scan_results = self.scanner.execute(scan_input)
+                    round_results["scan_results"] = scan_results
 
-                self.log(f"\n⏱️ 扫描耗时: {pipeline_results['execution_time']['scan']:.2f}秒")
+                # 2. 分析 (仅在第一轮)
+                if "analyze" in workflow and enable_agents.get("analyzer") and attempt == 0:
+                    self.log(f"\n📊 阶段 2/4：缺陷分析")
+                    scan_res = round_results.get("scan_results", {})
 
-            # 2. 分析阶段
-            if "analyze" in workflow and enable_agents.get("analyzer") and pipeline_results["scan_results"]:
-                self.log(f"\n{'=' * 80}")
-                self.log("📊 阶段 2/4：问题分析")
-                self.log("=" * 80)
+                    # 调用 Analyzer
+                    analyze_input = {
+                        "scan_results": scan_res,
+                        "files": current_files
+                    }
+                    analyze_perception = self.analyzer.perceive(analyze_input)
+                    analyze_decision = self.analyzer.decide(analyze_perception)
+                    # 执行分析
+                    current_analysis = self.analyzer.execute(analyze_decision)
 
-                start_time = time.time()
+                # 3. 修复 (Fixer)
+                if "fix" in workflow and enable_agents.get("fixer"):
+                    self.log(f"\n🔧 阶段 3/4：代码修复 (Round {attempt})")
 
-                analyze_input = {
-                    "scan_results": pipeline_results["scan_results"],
-                    "files": files
-                }
-                analyze_perception = self.analyzer.perceive(analyze_input)
-                analyze_decision = self.analyzer.decide(analyze_perception)
-                analyze_decision.update(analyze_perception)
+                    fix_input = {
+                        "analysis": current_analysis,  # 第一轮用的静态分析
+                        "files": current_files,  # 最新的文件内容
+                        "user_request": decision.get("user_request", ""),
+                        # 传入动态反馈 (如果是重试轮次)
+                        "dynamic_feedback": current_dynamic_feedback
+                    }
 
-                analysis = self.analyzer.execute(analyze_decision)
+                    # Fixer 执行逻辑
+                    fix_perception = self.fixer.perceive(fix_input)
+                    fix_decision = self.fixer.decide(fix_perception)
+                    # 确保传入 files
+                    fix_decision.update({"files": current_files})
 
-                pipeline_results["analysis"] = analysis
-                pipeline_results["execution_time"]["analyze"] = time.time() - start_time
+                    fix_results = self.fixer.execute(fix_decision)
+                    round_results["fix_results"] = fix_results
 
-                self.log(f"\n⏱️ 分析耗时: {pipeline_results['execution_time']['analyze']:.2f}秒")
+                    # 🔥🔥🔥 2. 更新累积结果 🔥🔥🔥
+                    # 无论成功失败，只要 Fixer 返回了该文件的结果，就更新到累积字典中
+                    # 这样保证了最后输出的是所有涉及文件的最新状态
+                    current_round_fixed = fix_results.get("fixed_files", [])
+                    for f in current_round_fixed:
+                        filename = f.get("file")
+                        if filename:
+                            accumulated_fixed_files[filename] = f
 
-            # 3. 修复阶段
-            # ✅ 不再用 truthy 判断拦截，而是只要 fixer 启用就运行；
-            #    analysis 可能是 None 或 {}，FixerAgent 内部有 DebugBench 兜底逻辑。
-            analysis_data = pipeline_results.get("analysis") or {}
+                    # 更新 current_files 为修复后的文件 (用于下一轮或验证)
+                    current_files = self._update_files_content(current_files, current_round_fixed)
 
-            if "fix" in workflow and enable_agents.get("fixer"):
-                self.log(f"\n{'=' * 80}")
-                self.log("🔧 阶段 3/4：代码修复")
-                self.log("=" * 80)
+                # 4. 验证 (Verifier) - 包含动态检测
+                if "verify" in workflow and enable_agents.get("verifier"):
+                    self.log(f"\n✅ 阶段 4/4：验证与动态检测 (Round {attempt})")
 
-                start_time = time.time()
+                    verify_input = {
+                        "fix_results": round_results.get("fix_results", {}),
+                        # 注意：Verifier 需要的是 fixed_files (list of dict)
+                        "fixed_files": round_results.get("fix_results", {}).get("fixed_files", []),
+                        "original_files": files,  # 最原始的文件
+                        "test_cases": decision.get("test_cases", []),
+                        "attempt": attempt  # 传递轮次
+                    }
 
-                fix_input = {
-                    "analysis": analysis_data,
-                    "files": files,
-                    "user_request": user_request
-                }
-                fix_perception = self.fixer.perceive(fix_input)
-                fix_decision = self.fixer.decide(fix_perception)
-                fix_decision.update(fix_perception)
+                    # Verifier 执行逻辑
+                    verify_perception = self.verifier.perceive(verify_input)
+                    verify_decision = self.verifier.decide(verify_perception)
+                    verification_results = self.verifier.execute(verify_decision)
 
-                fix_results = self.fixer.execute(fix_decision)
+                    round_results["verification"] = verification_results
 
-                pipeline_results["fix_results"] = fix_results
-                pipeline_results["execution_time"]["fix"] = time.time() - start_time
+                    # 检查是否需要重试
+                    has_dynamic_issues = verification_results.get("has_dynamic_issues", False)
+                    dynamic_report = verification_results.get("dynamic_report", {})
 
-                self.log(f"\n⏱️ 修复耗时: {pipeline_results['execution_time']['fix']:.2f}秒")
+                    # 记录本轮结果到历史
+                    final_pipeline_results["history"].append(round_results)
 
-            # 4. 验证阶段
-            if "verify" in workflow and enable_agents.get("verifier") and pipeline_results["fix_results"]:
-                self.log(f"\n{'=' * 80}")
-                self.log("✅ 阶段 4/4：修复验证")
-                self.log("=" * 80)
+                    if has_dynamic_issues:
+                        if attempt < MAX_RETRIES:
+                            self.log(f"⚠️ 检测到动态运行时错误，准备进入下一轮修复...")
+                            current_dynamic_feedback = dynamic_report
+                            continue  # 进入下一次循环
+                        else:
+                            self.log(f" 达到最大重修次数，动态修复未完全成功。")
+                    else:
+                        self.log(f"🎉 验证通过！没有发现动态运行时错误。")
+                        final_pipeline_results["success"] = True
+                        break  # 成功，退出循环
 
-                start_time = time.time()
+            except Exception as e:
+                self.log(f"❌ Round {attempt} 发生错误: {e}")
+                import traceback
+                traceback.print_exc()
+                # 即使出错，也要记录已有的结果
+                final_pipeline_results["history"].append(round_results)
+                final_pipeline_results["error"] = str(e)
+                break
 
-                verify_input = {
-                    "fix_results": pipeline_results["fix_results"],
-                    "original_files": files,
-                    "original_analysis": pipeline_results["analysis"],
-                    "test_cases": test_cases
-                }
-                verify_perception = self.verifier.perceive(verify_input)
-                verify_decision = self.verifier.decide(verify_perception)
-                verify_decision.update(verify_perception)
+        # --- 循环结束后的结果汇总 ---
 
-                verification = self.verifier.execute(verify_decision)
+        # 🔥🔥🔥 3. 构造最终的 fix_results (从累积字典中) 🔥🔥🔥
+        if accumulated_fixed_files:
+            final_fixed_files_list = list(accumulated_fixed_files.values())
 
-                pipeline_results["verification"] = verification
-                pipeline_results["execution_time"]["verify"] = time.time() - start_time
+            if "fix_results" not in final_pipeline_results:
+                final_pipeline_results["fix_results"] = {}
 
-                self.log(f"\n⏱️ 验证耗时: {pipeline_results['execution_time']['verify']:.2f}秒")
+            # 强制覆盖为全量累积列表
+            final_pipeline_results["fix_results"]["fixed_files"] = final_fixed_files_list
 
-            pipeline_results["success"] = True
+            # 重新计算统计信息
+            success_count = sum(1 for f in final_fixed_files_list if f.get("success"))
+            failed_count = len(final_fixed_files_list) - success_count
 
-        except Exception as e:
-            self.log(f"\n❌ 执行过程中发生错误: {str(e)}")
-            import traceback
-            error_trace = traceback.format_exc()
-            self.log(f"\n错误详情:\n{error_trace}")
-            pipeline_results["error"] = str(e)
-            pipeline_results["success"] = False
+            final_pipeline_results["fix_results"]["summary"] = {
+                "total_files": len(final_fixed_files_list),
+                "successfully_fixed": success_count,
+                "failed": failed_count,
+                "total_fixes": sum(f.get("fixed_count", 0) for f in final_fixed_files_list)
+            }
+
+        # 🔥🔥🔥 4. 确保 scan_results 存在 (防止 UI 报错) 🔥🔥🔥
+        # 如果当前结果中没有 scan_results，尝试从历史记录（通常是第一轮）中找回
+        if not final_pipeline_results.get("scan_results") and final_pipeline_results.get("history"):
+            for history_round in final_pipeline_results["history"]:
+                if history_round.get("scan_results"):
+                    final_pipeline_results["scan_results"] = history_round["scan_results"]
+                    break
+
+        # 同样确保 verification 也是最新的
+        if not final_pipeline_results.get("verification") and final_pipeline_results.get("history"):
+            final_pipeline_results["verification"] = final_pipeline_results["history"][-1].get("verification")
 
         # 生成总结
-        self._generate_summary(pipeline_results)
-
-        return pipeline_results
+        self._generate_summary(final_pipeline_results)
+        return final_pipeline_results
 
     def _generate_summary(self, results: Dict[str, Any]):
         """生成执行总结"""
+        # 这里的逻辑是为了防止 execution_time 为空导致报错
         exec_time = results.get("execution_time", {})
-        total_time = sum(exec_time.values())
+        # 如果 exec_time 是空的，就设总时间为 0
+        total_time = sum(exec_time.values()) if exec_time else 0.0
 
         self.log("")
         self.log("=" * 80)
@@ -253,22 +312,19 @@ class OrchestratorAgent(BaseAgent):
             for stage, duration in exec_time.items():
                 percentage = (duration / total_time * 100)
                 self.log(f"   - {stage}: {duration:.2f}秒 ({percentage:.1f}%)")
-        else:
-            for stage, duration in exec_time.items():
-                self.log(f"   - {stage}: {duration:.2f}秒")
 
         # 扫描结果
-        scan_results = results.get("scan_results", {}) or {}
-        scan_summary = scan_results.get("summary", {}) or {}
+        #scan_results = results.get("scan_results", {}) or {}
+        #scan_summary = scan_results.get("summary", {}) or {}
 
-        self.log("")
-        self.log("🔍 扫描结果:")
-        self.log(f"   - 发现问题: {scan_summary.get('total_defects', 0)} 个")
+        #self.log("")
+        #self.log("🔍 扫描结果:")
+        #self.log(f"   - 发现问题: {scan_summary.get('total_defects', 0)} 个")
 
-        by_severity = scan_summary.get("by_severity", {}) or {}
-        self.log(f"   - 高危: {by_severity.get('HIGH', 0)} 个")
-        self.log(f"   - 中危: {by_severity.get('MEDIUM', 0)} 个")
-        self.log(f"   - 低危: {by_severity.get('LOW', 0)} 个")
+        #by_severity = scan_summary.get("by_severity", {}) or {}
+        #self.log(f"   - 高危: {by_severity.get('HIGH', 0)} 个")
+        #self.log(f"   - 中危: {by_severity.get('MEDIUM', 0)} 个")
+        #self.log(f"   - 低危: {by_severity.get('LOW', 0)} 个")
 
         # 修复结果
         fix_results = results.get("fix_results", {}) or {}
@@ -280,6 +336,27 @@ class OrchestratorAgent(BaseAgent):
         self.log(f"   - 成功修复: {fix_summary.get('successfully_fixed', 0)} 个")
         self.log(f"   - 修复失败: {fix_summary.get('failed', 0)} 个")
         self.log(f"   - 总修复数: {fix_summary.get('total_fixes', 0)} 处")
+    def _update_files_content(self, original_files, fixed_files_list):
+            """辅助函数：用修复后的内容更新文件列表"""
+            # 创建一个 map 方便查找
+            fixed_map = {f.get('file'): f.get('content') for f in fixed_files_list if f.get('success')}
+
+            updated = []
+            for f in original_files:
+                new_f = f.copy()
+                fname = f.get('file')
+                # 尝试多种匹配策略 (path, basename) 与 FixerAgent 类似
+                if fname in fixed_map:
+                    new_f['content'] = fixed_map[fname]
+                else:
+                    # 简单的 fallback，实际情况可能需要更复杂的路径匹配
+                    base = os.path.basename(fname)
+                    for k, v in fixed_map.items():
+                        if os.path.basename(k) == base:
+                            new_f['content'] = v
+                            break
+                updated.append(new_f)
+            return updated
 
 
 def run_multi_language_repair(files: List[Dict],

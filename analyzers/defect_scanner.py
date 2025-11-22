@@ -855,6 +855,15 @@ class DefectScanner:
                     pass
 
         summary["pytest"] = {"skipped": True, "reason": "未配置测试"}
+         # 添加新的动态检测
+        try:
+            from .dynamic_detector import PythonDynamicDetector
+            detector = PythonDynamicDetector(self.files)
+            dynamic_result = detector.detect_all()
+            summary["dynamic_detection"] = dynamic_result
+        except Exception as e:
+            summary["dynamic_detection_error"] = str(e)
+        
         return summary
 
     # ========== 合并相似/去重（无上限） ==========

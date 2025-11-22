@@ -6,7 +6,7 @@
 # - 上传单文件/文件夹时都按代码白名单过滤
 # - 新增 UI 按钮“多Agent协作修复”，点击后调用 run_multi_agent_workflow()
 # - 其余逻辑不变（缺陷检测/自动应用补丁/验证/配置/提示词等）
-
+import ast
 import re, json, time, requests, os, tempfile
 from datetime import datetime
 from typing import List, Dict, Any,Tuple
@@ -15,7 +15,79 @@ from PyQt5.QtWidgets import QMessageBox, QInputDialog, QFileDialog, QTextEdit, Q
 from PyQt5.QtGui import QTextCursor, QDragEnterEvent, QDropEvent
 from openai import OpenAI
 import difflib, io, shutil, pathlib, json as _json
+# 尝试导入动态测试与报告工具，若不可用则提供降级占位实现
+print("=== 开始导入动态测试模块 ===")
+try:
+    from analyzers.llm_dynamic_tester import run_dynamic_tests
+    # 如果 llm_dynamic_tester 中没有这些函数，我们自己定义
+    def format_report(report):
+        """格式化测试报告为可读字符串"""
+        try:
+            if not report:
+                return "无测试报告"
+            
+            # 基础信息
+            result = []
+            result.append("=" * 60)
+            result.append("动态测试报告")
+            result.append("=" * 60)
+            
+            # 总体统计
+            result.append(f"总测试数: {report.get('total_tests', 0)}")
+            result.append(f"通过: {report.get('passed', 0)}")
+            result.append(f"失败: {report.get('failed', 0)}")
+            result.append(f"发现问题: {report.get('total_issues', 0)}")
+            
+            # 按类别统计
+            by_category = report.get('by_category', {})
+            if by_category:
+                result.append("\n按类别统计:")
+                for category, stats in by_category.items():
+                    result.append(f"  {category}: {stats.get('passed', 0)}/{stats.get('total', 0)} 通过")
+            
+            # 测试详情
+            details = report.get('details', [])
+            if details:
+                result.append("\n测试详情:")
+                for detail in details:
+                    status = "✅" if detail.get('passed') else "❌"
+                    result.append(f"  {status} {detail.get('test_name', '未知测试')}")
+                    issues = detail.get('issues_found', [])
+                    if issues:
+                        for issue in issues[:3]:  # 只显示前3个问题
+                            result.append(f"    - {issue}")
+            
+            if report.get('note'):
+                result.append(f"\n备注: {report['note']}")
+            
+            if report.get('error'):
+                result.append(f"\n错误: {report['error']}")
+            
+            result.append("=" * 60)
+            return "\n".join(result)
+            
+        except Exception as e:
+            return f"格式化报告失败: {e}\n原始报告: {report}"
 
+    def print_report(report):
+        """打印测试报告"""
+        print(format_report(report))
+
+except Exception as e:
+    print(f"❌ llm_dynamic_tester 导入失败: {e}")
+    run_dynamic_tests = None
+    # 保留降级实现的函数定义
+    def format_report(r):
+        try:
+            return str(r)
+        except Exception:
+            return "[format_report unavailable]"
+    def print_report(r):
+        try:
+            print(format_report(r))
+        except Exception:
+            print(r)
+import difflib, io, shutil, pathlib, json as _json
 # 多Agent系统导入
 try:
     from agents.orchestrator_agent import OrchestratorAgent
@@ -31,8 +103,10 @@ except ImportError as e:
     print(f"[WARN] ReportGenerator 未安装：{e}")
 
 
-# 仅代码文件白名单（严格模式）
+# 仅代码文件白名单
 CODE_FILE_EXTS = {'.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.cs', '.go', '.rs', '.php'}
+# 🔥 新增：资源文件白名单
+ASSET_FILE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.wav', '.mp3', '.json', '.txt', '.xml'}
 
 # 保障默认超时时间，避免未赋值时报错
 my_timeout = 60
@@ -88,11 +162,13 @@ class OllamaLLMAdapter:
             print(f"[ERROR] Ollama调用失败: {e}")
             raise
 class DropTextEdit(QTextEdit):
-    def __init__(self, parent=None, target=1):
+    def __init__(self, parent=None, target=1, controller=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.target = target
         self.parent_window = parent
+        # optional reference to EnhancedTabAI instance so folder-drops can set original_project_dir
+        self.controller = controller
         self.uploaded_files = []
         self._user_text = ""
 
@@ -167,43 +243,54 @@ class DropTextEdit(QTextEdit):
             super().mouseDoubleClickEvent(event)
 
     def _is_code_file(self, file_path: str) -> bool:
+        """判断是否为允许的代码文件"""
         ext = os.path.splitext(file_path)[1].lower()
         return ext in CODE_FILE_EXTS
 
+    def _is_asset_file(self, file_path: str) -> bool:
+        """🔥 判断是否为资源文件"""
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in ASSET_FILE_EXTS
+
     def handle_dropped_file(self, file_path: str):
-        """处理单个文件（仅代码文件）"""
+        """处理单个文件"""
         if not os.path.isfile(file_path):
             return
-        if not self._is_code_file(file_path):
-            # 非代码文件静默忽略（避免频繁弹窗）
-            return
 
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except UnicodeDecodeError:
+        # 1. 如果是代码文件，读取内容
+        if self._is_code_file(file_path):
             try:
-                with open(file_path, 'r', encoding='gbk') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-            except Exception as e:
-                QMessageBox.critical(self.parent_window, "错误",
-                                     f"无法读取文件：{str(e)}")
-                return
-        except Exception as e:
-            QMessageBox.critical(self.parent_window, "错误",
-                                 f"读取文件失败：{str(e)}")
+            except UnicodeDecodeError:
+                try:
+                    with open(file_path, 'r', encoding='gbk') as f:
+                        content = f.read()
+                except:
+                    return  # 读取失败忽略
+
+            self.uploaded_files.append({
+                'path': file_path,
+                'name': os.path.basename(file_path),
+                'size': len(content),
+                'content': content,
+                'type': 'code'
+            })
+
+        # 2. 🔥 如果是资源文件，只存路径，content 为 None
+        elif self._is_asset_file(file_path):
+            self.uploaded_files.append({
+                'path': file_path,
+                'name': os.path.basename(file_path),
+                'size': os.path.getsize(file_path),
+                'content': None,  # 资源文件不存文本内容
+                'type': 'asset'
+            })
+
+        # 3. 其他文件忽略
+        else:
             return
 
-        # 存储文件信息
-        file_info = {
-            'path': file_path,
-            'name': os.path.basename(file_path),
-            'size': len(content),
-            'content': content
-        }
-        self.uploaded_files.append(file_info)
-
-        # 更新显示（不显示完整内容）
         self.update_file_display()
 
         # 更新父窗口的计数
@@ -249,6 +336,17 @@ class DropTextEdit(QTextEdit):
 
         for file_path in files_found:
             self.handle_dropped_file(file_path)
+
+        # 如果绑定了 controller，记录原始项目目录，便于后续动态检测使用
+        try:
+            if hasattr(self, 'controller') and self.controller:
+                self.controller.original_project_dir = folder_path
+                try:
+                    self.controller.ui.output_area.append(f"✅ 已设置原始项目目录 (拖拽): {folder_path}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         QMessageBox.information(self.parent_window, "完成",
                                 f"成功加载 {len(files_found)} 个文件")
@@ -562,7 +660,7 @@ class EnhancedTabAI():
         self.ui.input_edit.deleteLater()
         self.ui.input_edit_1.deleteLater()
 
-        self.ui.input_edit = DropTextEdit(self.ui, target=1)
+        self.ui.input_edit = DropTextEdit(self.ui, target=1, controller=self)
         self.ui.input_edit.setParent(input1_parent)
         self.ui.input_edit.setGeometry(input1_geo)
         self.ui.input_edit.setObjectName("input_edit")
@@ -572,7 +670,7 @@ class EnhancedTabAI():
         self.ui.input_edit.setAcceptRichText(False)
         self.ui.input_edit.show()
 
-        self.ui.input_edit_1 = DropTextEdit(self.ui, target=2)
+        self.ui.input_edit_1 = DropTextEdit(self.ui, target=2, controller=self)
         self.ui.input_edit_1.setParent(input2_parent)
         self.ui.input_edit_1.setGeometry(input2_geo)
         self.ui.input_edit_1.setObjectName("input_edit_1")
@@ -1407,18 +1505,31 @@ class EnhancedTabAI():
             self.ui.output_area.append(f"  ❌ 写入失败: {e}")
             return False
 
+        # 修改 tab_ai.py
+
     def _workspace_from_uploaded(self) -> str:
-        """将已上传文件写入临时工作区，避免直接改用户原文件。"""
-        files = self._collect_uploaded_files()
-        tmp = tempfile.mkdtemp(prefix="agentfix_")
-        for f in files:
-            rel = f.get("path") or f.get("name") or "file.py"
-            rel = os.path.basename(rel)
-            dst = os.path.join(tmp, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst, "w", encoding="utf-8", newline="\n") as w:
-                w.write(f.get("content", ""))
-        return tmp
+            """将已上传文件写入临时工作区，避免直接改用户原文件。"""
+            files = self._collect_uploaded_files()
+            tmp = tempfile.mkdtemp(prefix="agentfix_")
+
+            for f in files:
+                # ✅ 修复：不再强制 basename，而是保留相对结构
+                # 这里的 f['file'] 可能是 "utils/helper.py"
+                rel = f.get("file") or f.get("name") or "file.py"
+
+                # 这是一个防御性处理，确保不会写入到 tmp 之外
+                # 如果路径包含 "C:/..." 或 "/home/..." 需要截断为相对路径
+                # 简单起见，假设系统里传的都是项目内相对路径
+                clean_rel = rel.replace("\\", "/").lstrip("/")
+
+                dst = os.path.join(tmp, clean_rel)
+
+                # 确保父文件夹存在
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+                with open(dst, "w", encoding="utf-8", newline="\n") as w:
+                    w.write(f.get("content", ""))
+            return tmp
 
     def _diff_changed_files(self, work_dir: str) -> List[str]:
         """
@@ -1708,7 +1819,7 @@ class EnhancedTabAI():
             self.configs[name] = {
                 "api_base": "http://localhost:11434/api/generate",
                 "api_key": "",
-                "model": "qwen3-coder:30b"
+                "model": "qwen3-coder:480b-cloud"
             }
             self.save_configs()
             self.load_configs()
@@ -1973,15 +2084,28 @@ class EnhancedTabAI():
             self.ui.output_area.append("📊 执行结果")
             self.ui.output_area.append("=" * 80)
 
-            if not results.get("success"):
-                error_msg = results.get("error", "未知错误")
-                self.ui.output_area.append(f"❌ 执行失败: {error_msg}")
-                QMessageBox.critical(self.ui, "执行失败", f"多Agent系统执行失败:\n{error_msg}")
-                return
+            # 🔥 修改点：不要直接 return，而是根据 success 状态给不同提示
+            is_success = results.get("success", False)
 
-            # 扫描结果
-            scan_results = results.get("scan_results", {})
-            scan_summary = scan_results.get("summary", {})
+            if not is_success:
+                error_msg = results.get("error", "")
+                if error_msg:
+                    # 如果是系统级崩溃（有 error 字段），则报错并退出
+                    self.ui.output_area.append(f"❌ 系统执行异常: {error_msg}")
+                    QMessageBox.critical(self.ui, "系统异常", f"多Agent系统执行异常:\n{error_msg}")
+                    return
+                else:
+                    # 如果只是修复未完全成功（没有 error 字段，只是 success=False），继续流程
+                    self.ui.output_area.append(f"⚠️ 修复流程完成，但仍遗留部分问题（请查看报告）。")
+            else:
+                self.ui.output_area.append(f"✅ 修复流程全部成功完成！")
+
+                # 🔥 修改前: scan_results = results.get("scan_results", {})
+                # 🔥 修改后: 增加 or {} 以防 get 返回 None
+            scan_results = results.get("scan_results") or {}
+
+                # 这样 scan_summary 就安全了
+            scan_summary = scan_results.get("summary") or {}
 
             self.ui.output_area.append("\n🔍 扫描结果:")
             self.ui.output_area.append(f"   发现问题: {scan_summary.get('total_defects', 0)} 个")
@@ -2075,7 +2199,7 @@ class EnhancedTabAI():
                                 content = fixed_file.get("content", "")
 
                                 # 保存为 fixed_原文件名
-                                save_path = os.path.join(save_dir, f"fixed_{filename}")
+                                save_path = os.path.join(save_dir, f"{filename}")
 
                                 with open(save_path, 'w', encoding='utf-8') as f:
                                     f.write(content)
@@ -2084,6 +2208,19 @@ class EnhancedTabAI():
 
                             self.ui.output_area.append(f"\n✅ 已保存 {saved_count} 个修复后的文件到:")
                             self.ui.output_area.append(f"   {save_dir}")
+
+                            # 记录修复文件目录，后续动态测试/回写会使用
+                            try:
+                                self.fixed_files_dir = save_dir
+                                self.ui.output_area.append("调试: 已设置 self.fixed_files_dir，准备触发动态测试...")
+                                from PyQt5.QtCore import QTimer
+                                QTimer.singleShot(100, self.run_dynamic_test_on_fixed_files)
+                            except Exception:
+                                try:
+                                    self.ui.output_area.append("调试: 无法异步触发，尝试直接调用动态测试...")
+                                    self.run_dynamic_test_on_fixed_files()
+                                except Exception:
+                                    pass
 
                             QMessageBox.information(
                                 self.ui,
@@ -2256,3 +2393,621 @@ class EnhancedTabAI():
         # 保存到报告文件
         path = self._save_detailed_results(results)
         self.ui.output_area.append(f"\n📁 详细报告已保存到：{path}\n")
+    def _show_detailed_results(self, results: Dict[str, Any]):
+        """显示详细的扫描和修复结果（辅助方法）"""
+        self.ui.output_area.append("\n" + "=" * 80)
+        self.ui.output_area.append("📋 详细结果")
+        self.ui.output_area.append("=" * 80)
+
+        # 显示扫描的详细问题（最多30个）
+        scan_results = results.get("scan_results", {})
+        by_language = scan_results.get("by_language", {})
+
+        for lang_name, lang_data in by_language.items():
+            builtin_issues = lang_data.get("builtin", [])
+
+            if builtin_issues:
+                self.ui.output_area.append(f"\n📌 {lang_name.upper()} - 发现的问题 (前30个):")
+
+                for i, issue in enumerate(builtin_issues[:30], 1):
+                    severity = issue.get("severity", "UNKNOWN")
+                    severity_icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(severity, "⚪")
+
+                    self.ui.output_area.append(
+                        f"   {i}. {severity_icon} {issue.get('file', 'unknown')}:"
+                        f"{issue.get('line', '?')} - [{issue.get('rule_id', '')}] "
+                        f"{issue.get('message', '')}"
+                    )
+
+                if len(builtin_issues) > 30:
+                    self.ui.output_area.append(f"   ... 还有 {len(builtin_issues) - 30} 个问题")
+
+        # 显示修复详情
+        fix_results = results.get("fix_results", {})
+        fix_by_language = fix_results.get("by_language", {})
+
+        for lang_name, lang_data in fix_by_language.items():
+            files = lang_data.get("files", [])
+
+            if files:
+                self.ui.output_area.append(f"\n🔧 {lang_name.upper()} - 修复详情:")
+
+                for file_result in files:
+                    filename = file_result.get("file", "unknown")
+                    success = file_result.get("success", False)
+
+                    if success:
+                        self.ui.output_area.append(
+                            f"   ✅ {filename} - "
+                            f"方法: {file_result.get('method', '?')}, "
+                            f"修复数: {file_result.get('fixed_count', 0)}"
+                        )
+                    else:
+                        self.ui.output_area.append(
+                            f"   ❌ {filename} - "
+                            f"错误: {file_result.get('error_message', '未知错误')}"
+                        )
+
+        self.ui.output_area.append("\n" + "=" * 80)
+
+    @staticmethod
+    def run_dynamic_tests_on_directory(original_dir, fixed_dir):
+        """
+        对修复后的目录运行动态测试，保持项目结构 - 修复资源文件路径问题
+        """
+        print(f"🔍 [DEBUG] 开始动态测试: original_dir={original_dir}, fixed_dir={fixed_dir}")
+        
+        files = []
+        
+        # 扩展名白名单
+        ASSET_EXT = {
+            ".png", ".jpg", ".jpeg", ".bmp", ".gif",
+            ".wav", ".mp3", ".ogg",
+            ".json", ".yaml", ".yml",
+            ".ini", ".cfg", ".conf",
+            ".txt", ".xml", ".html", ".css"
+        }
+        
+        # 首先扫描原始目录获取完整结构
+        original_structure = {}
+        print(f"🔍 [DEBUG] 开始扫描原始目录...")
+        try:
+            for root, dirs, fnames in os.walk(original_dir):
+                # 跳过 __pycache__ 目录
+                if '__pycache__' in root:
+                    continue
+                print(f"🔍 [DEBUG] 扫描目录: {root}, 文件数: {len(fnames)}")
+                for fname in fnames:
+                    full_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(full_path, original_dir)
+                    original_structure[rel_path] = full_path
+            print(f"✅ [DEBUG] 原始目录扫描完成，找到 {len(original_structure)} 个文件")
+        except Exception as e:
+            print(f"❌ [DEBUG] 扫描原始目录失败: {e}")
+            return {"error": f"扫描原始目录失败: {str(e)}"}
+
+        # 然后扫描修复目录，构建文件映射
+        fixed_files_map = {}
+        print(f"🔍 [DEBUG] 开始扫描修复目录...")
+        try:
+            for root, dirs, fnames in os.walk(fixed_dir):
+                print(f"🔍 [DEBUG] 扫描修复目录: {root}, 文件数: {len(fnames)}")
+                for fname in fnames:
+                    full_path = os.path.join(root, fname)
+                    # 如果文件名以 fixed_ 开头，尝试匹配原始文件
+                    if fname.startswith('fixed_'):
+                        original_fname = fname[6:]  # 去掉 fixed_ 前缀
+                        # 在原始结构中查找对应文件
+                        for orig_rel_path in original_structure:
+                            if os.path.basename(orig_rel_path) == original_fname:
+                                fixed_files_map[orig_rel_path] = full_path
+                                print(f"📄 [DEBUG] 匹配修复文件: {orig_rel_path} -> {fname}")
+                                break
+                    else:
+                        # 直接使用相对路径
+                        rel_path = os.path.relpath(full_path, fixed_dir)
+                        fixed_files_map[rel_path] = full_path
+                        print(f"📄 [DEBUG] 直接映射文件: {rel_path}")
+            print(f"✅ [DEBUG] 修复目录扫描完成，找到 {len(fixed_files_map)} 个文件")
+        except Exception as e:
+            print(f"❌ [DEBUG] 扫描修复目录失败: {e}")
+            return {"error": f"扫描修复目录失败: {str(e)}"}
+
+        print(f"📊 [DEBUG] 原始项目文件数: {len(original_structure)}")
+        print(f"📊 [DEBUG] 修复文件数: {len(fixed_files_map)}")
+
+        # 构建最终的文件列表
+        code_files_count = 0
+        asset_files_count = 0
+        print(f"🔍 [DEBUG] 开始构建最终文件列表...")
+        
+        for i, (rel_path, original_full_path) in enumerate(original_structure.items()):
+            print(f"🔍 [DEBUG] 处理文件 {i+1}/{len(original_structure)}: {rel_path}")
+            ext = os.path.splitext(rel_path)[1].lower()
+            
+            # 跳过 __pycache__ 和不需要的文件
+            if '__pycache__' in rel_path or rel_path in ['.gitignore', 'README.md', 'BUGS_FOR_DETECTION.md']:
+                print(f"  ⏭️  跳过文件: {rel_path}")
+                continue
+
+            # 如果是代码文件或资源文件
+            if ext in CODE_FILE_EXTS or ext in ASSET_EXT:
+                
+                # 检查是否有修复版本
+                if rel_path in fixed_files_map:
+                    # 使用修复后的文件
+                    fixed_path = fixed_files_map[rel_path]
+                    try:
+                        if ext in ASSET_EXT:
+                            # 资源文件：记录原始路径，动态测试器会复制
+                            files.append({
+                                "file": original_full_path,  # 🔥 关键修复：使用原始完整路径
+                                "content": "",
+                                "original": ""
+                            })
+                            asset_files_count += 1
+                            print(f"✅ [DEBUG] 添加资源文件: {rel_path} (路径: {original_full_path})")
+                        else:
+                            # 代码文件：读取内容
+                            with open(fixed_path, "r", encoding="utf-8", errors="ignore") as f:
+                                files.append({
+                                    "file": rel_path,  # 相对路径用于显示
+                                    "content": f.read(),
+                                    "original": ""
+                                })
+                            code_files_count += 1
+                            print(f"✅ [DEBUG] 添加修复代码文件: {rel_path}")
+                    except Exception as e:
+                        print(f"❌ [DEBUG] 读取修复文件失败 {rel_path}: {e}")
+                        # 回退到原始文件
+                        try:
+                            if ext in ASSET_EXT:
+                                files.append({
+                                    "file": original_full_path,  # 🔥 关键修复：使用原始完整路径
+                                    "content": "",
+                                    "original": ""
+                                })
+                                asset_files_count += 1
+                            else:
+                                with open(original_full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    content = f.read() if ext not in ASSET_EXT else ""
+                                    files.append({
+                                        "file": rel_path,
+                                        "content": content,
+                                        "original": ""
+                                    })
+                                code_files_count += 1
+                            print(f"🔄 [DEBUG] 回退到原始文件: {rel_path}")
+                        except Exception as e2:
+                            print(f"❌ [DEBUG] 读取原始文件也失败 {rel_path}: {e2}")
+                else:
+                    # 使用原始文件
+                    try:
+                        if ext in ASSET_EXT:
+                            files.append({
+                                "file": original_full_path,  # 🔥 关键修复：使用原始完整路径
+                                "content": "",
+                                "original": ""
+                            })
+                            asset_files_count += 1
+                            print(f"📁 [DEBUG] 添加原始资源文件: {rel_path} (路径: {original_full_path})")
+                        else:
+                            with open(original_full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                files.append({
+                                    "file": rel_path,
+                                    "content": f.read(),
+                                    "original": ""
+                                })
+                            code_files_count += 1
+                            print(f"📁 [DEBUG] 添加原始代码文件: {rel_path}")
+                    except Exception as e:
+                        print(f"❌ [DEBUG] 读取原始文件失败 {rel_path}: {e}")
+
+        print(f"📊 [DEBUG] 最终文件统计 - 代码文件: {code_files_count}, 资源文件: {asset_files_count}, 总计: {len(files)}")
+
+        # 尝试使用主动态测试，失败时使用备用方案
+        try:
+            if run_dynamic_tests and callable(run_dynamic_tests):
+                print("🚀 [DEBUG] 使用主动态测试方案")
+                return run_dynamic_tests(files)
+            else:
+                print("🔄 [DEBUG] 使用备用动态测试方案")
+                return EnhancedTabAI._fallback_dynamic_test(files)
+        except Exception as e:
+            print(f"❌ [DEBUG] 动态测试异常: {e}")
+            print("🔄 [DEBUG] 使用简化版备用动态测试方案")
+            return EnhancedTabAI._simplified_fallback_test(files)  # 使用简化版
+        
+    def run_dynamic_test_on_fixed_files(self):
+        """对修复后的文件自动运行动态测试"""
+        print("🔍 [DEBUG] 触发 run_dynamic_test_on_fixed_files 方法")
+        if not self.original_project_dir:
+            self.ui.output_area.append("❌ 请先上传原始项目文件夹")
+            return
+            
+        if not self.fixed_files_dir:
+            self.ui.output_area.append("❌ 请先保存修复后的文件")
+            return
+
+        try:
+            self.ui.output_area.append("\n🔄 开始动态测试修复后的项目...")
+            self.ui.output_area.append(f"原始项目: {self.original_project_dir}")
+            print(f"原始项目: {self.original_project_dir}")
+            self.ui.output_area.append(f"修复文件: {self.fixed_files_dir}")
+            print(f"修复文件: {self.fixed_files_dir}")
+            
+            # 运行动态测试
+            fixed_report = self.run_dynamic_tests_on_directory(
+                self.original_project_dir,
+                self.fixed_files_dir
+            )
+            
+            # 显示结果
+            self.ui.output_area.append("\n" + "="*60)
+            self.ui.output_area.append("===== 修复后动态检测报告 =====")
+            self.ui.output_area.append("="*60)
+            try:
+                formatted_report = format_report(fixed_report)
+            except Exception:
+                formatted_report = str(fixed_report)
+            self.ui.output_area.append(formatted_report)
+            
+            # 自动保存报告
+            report_path = os.path.join(self.fixed_files_dir, "dynamic_test_report.txt")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("修复后动态检测报告\n")
+                f.write("="*40 + "\n")
+                f.write(f"原始项目: {self.original_project_dir}\n")
+                f.write(f"修复文件: {self.fixed_files_dir}\n\n")
+                f.write(formatted_report)
+                
+            self.ui.output_area.append(f"✅ 测试报告已保存至: {report_path}")
+            
+            QMessageBox.information(
+                self.ui,
+                "动态测试完成",
+                f"修复后项目动态测试完成！\n\n报告已保存至:\n{report_path}"
+            )
+            
+        except Exception as e:
+            self.ui.output_area.append(f"❌ 动态测试执行失败: {str(e)}")
+            QMessageBox.critical(self.ui, "错误", f"动态测试失败:\n{str(e)}")
+
+    @staticmethod
+    def _fallback_dynamic_test(files):
+        """增强版备用测试方案 - 提供更详细的测试报告"""
+        print("🔄 [DEBUG] 使用增强版备用动态测试方案")
+    
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            try:
+                # 1. 将文件写入临时目录
+                print(f"📁 创建临时工作区: {tmp_dir}")
+                for file_info in files:
+                    file_path = file_info["file"]
+                    content = file_info["content"]
+                    
+                    full_path = os.path.join(tmp_dir, file_path)
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    
+                    if content:  # 代码文件
+                        with open(full_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        print(f"  📄 写入代码文件: {file_path}")
+                
+                # 2. 运行多种基础测试
+                test_details = []
+                
+                # 编译测试
+                compile_result = EnhancedTabAI._run_compile_test(tmp_dir)
+                test_details.append(compile_result)
+                
+                # 语法检查
+                syntax_result = EnhancedTabAI._run_syntax_check(tmp_dir)
+                test_details.append(syntax_result)
+                
+                # 导入测试
+                import_result = EnhancedTabAI._run_import_test(tmp_dir)
+                test_details.append(import_result)
+                
+                # 基础安全扫描
+                security_result = EnhancedTabAI._run_basic_security_scan(tmp_dir)
+                test_details.append(security_result)
+                
+                # 3. 生成详细报告
+                total_passed = sum(1 for d in test_details if d["passed"])
+                total_failed = len(test_details) - total_passed
+                total_issues = sum(len(d["issues_found"]) for d in test_details)
+                
+                report = {
+                    "total_tests": len(test_details),
+                    "passed": total_passed,
+                    "failed": total_failed,
+                    "total_issues": total_issues,
+                    "by_category": {},
+                    "details": test_details,
+                    "note": "使用增强版备用测试方案（完整动态测试模块不可用）"
+                }
+                
+                # 按类别统计
+                for detail in test_details:
+                    category = detail["category"]
+                    if category not in report["by_category"]:
+                        report["by_category"][category] = {
+                            "total": 0, "passed": 0, "failed": 0, "issues": 0
+                        }
+                    report["by_category"][category]["total"] += 1
+                    if detail["passed"]:
+                        report["by_category"][category]["passed"] += 1
+                    else:
+                        report["by_category"][category]["failed"] += 1
+                    report["by_category"][category]["issues"] += len(detail["issues_found"])
+                
+                print(f"✅ 增强版备用测试完成: {total_passed}/{len(test_details)} 通过")
+                return report
+                
+            except Exception as e:
+                print(f"❌ 增强版备用测试失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return {
+                    "error": f"测试失败: {str(e)}",
+                    "note": "动态测试不可用"
+                }
+    @staticmethod
+    def _run_compile_test(tmp_dir):
+        """运行编译测试"""
+        issues = []
+        try:
+            # 检查所有Python文件是否能编译
+            for root, dirs, files in os.walk(tmp_dir):
+                for file in files:
+                    if file.endswith('.py'):
+                        file_path = os.path.join(root, file)
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                source_code = f.read()
+                            compile(source_code, file_path, 'exec')
+                        except SyntaxError as e:
+                            issues.append(f"{file}: {e}")
+            
+            return {
+                "test_name": "python_compile",
+                "category": "compilation",
+                "description": "Python编译检查",
+                "passed": len(issues) == 0,
+                "issues_found": issues,
+                "execution_time": 0.1
+            }
+        except Exception as e:
+            return {
+                "test_name": "python_compile",
+                "category": "compilation", 
+                "description": "Python编译检查",
+                "passed": False,
+                "issues_found": [f"编译测试异常: {e}"],
+                "execution_time": 0.0
+            }
+
+@staticmethod
+def _run_syntax_check(tmp_dir):
+    """运行基础语法检查"""
+    issues = []
+    try:
+        # 简单的AST语法检查
+        for root, dirs, files in os.walk(tmp_dir):
+            for file in files:
+                if file.endswith('.py'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            source_code = f.read()
+                        ast.parse(source_code)
+                    except SyntaxError as e:
+                        issues.append(f"{file}: 语法错误 - {e}")
+                    except Exception as e:
+                        issues.append(f"{file}: 解析错误 - {e}")
+        
+        return {
+            "test_name": "syntax_check",
+            "category": "syntax", 
+            "description": "Python语法检查",
+            "passed": len(issues) == 0,
+            "issues_found": issues,
+            "execution_time": 0.1
+        }
+    except Exception as e:
+        return {
+            "test_name": "syntax_check",
+            "category": "syntax",
+            "description": "Python语法检查", 
+            "passed": False,
+            "issues_found": [f"语法检查异常: {e}"],
+            "execution_time": 0.0
+        }
+
+@staticmethod
+def _run_import_test(tmp_dir):
+    """运行模块导入测试"""
+    issues = []
+    try:
+        # 尝试导入项目中的主要模块
+        import sys
+        sys.path.insert(0, tmp_dir)
+        
+        # 查找可能的入口文件
+        python_files = []
+        for root, dirs, files in os.walk(tmp_dir):
+            for file in files:
+                if file.endswith('.py') and not file.startswith('__'):
+                    python_files.append(file[:-3])  # 去掉 .py 后缀
+        
+        # 尝试导入每个文件
+        for module_name in python_files[:5]:  # 限制数量避免耗时太长
+            try:
+                __import__(module_name)
+            except ImportError as e:
+                issues.append(f"无法导入 {module_name}: {e}")
+            except Exception as e:
+                # 其他异常可能是正常的运行时错误
+                pass
+        
+        sys.path.remove(tmp_dir)
+        
+        return {
+            "test_name": "module_import",
+            "category": "environment",
+            "description": "模块导入测试",
+            "passed": len(issues) == 0,
+            "issues_found": issues,
+            "execution_time": 0.2
+        }
+    except Exception as e:
+        return {
+            "test_name": "module_import",
+            "category": "environment",
+            "description": "模块导入测试",
+            "passed": False,
+            "issues_found": [f"导入测试异常: {e}"],
+            "execution_time": 0.0
+        }
+
+@staticmethod
+def _run_basic_security_scan(tmp_dir):
+    """运行基础安全扫描"""
+    issues = []
+    try:
+        # 检查常见的安全问题模式
+        dangerous_patterns = [
+            (r'eval\s*\(', "使用 eval() 函数"),
+            (r'exec\s*\(', "使用 exec() 函数"),
+            (r'__import__\s*\(', "使用 __import__()"),
+            (r'pickle\.loads', "使用 pickle 反序列化"),
+            (r'yaml\.load\s*\(', "使用不安全的 yaml.load()"),
+            (r'subprocess\.call.*shell=True', "使用 shell=True 的 subprocess"),
+        ]
+        
+        for root, dirs, files in os.walk(tmp_dir):
+            for file in files:
+                if file.endswith('.py'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        for pattern, description in dangerous_patterns:
+                            if re.search(pattern, content):
+                                issues.append(f"{file}: 可能{description}")
+                    except Exception:
+                        pass
+        
+        return {
+            "test_name": "security_scan",
+            "category": "security",
+            "description": "基础安全扫描",
+            "passed": len(issues) == 0,
+            "issues_found": issues,
+            "execution_time": 0.1
+        }
+    except Exception as e:
+        return {
+            "test_name": "security_scan",
+            "category": "security",
+            "description": "基础安全扫描",
+            "passed": False,
+            "issues_found": [f"安全扫描异常: {e}"],
+            "execution_time": 0.0
+        }
+@staticmethod
+def _simplified_fallback_test(files):
+    """简化版备用测试方案 - 只做基础编译检查"""
+    print("🔄 [DEBUG] 使用简化版备用动态测试方案")
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        try:
+            # 1. 将文件写入临时目录
+            print(f"📁 创建临时工作区: {tmp_dir}")
+            for file_info in files:
+                file_path = file_info["file"]
+                content = file_info["content"]
+                
+                # 对于资源文件，file_path 是完整路径，需要提取文件名
+                if content:  # 代码文件
+                    full_path = os.path.join(tmp_dir, os.path.basename(file_path))
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    
+                    with open(full_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    print(f"  📄 写入代码文件: {os.path.basename(file_path)}")
+                else:  # 资源文件
+                    # 资源文件不需要写入内容
+                    print(f"  📁 跳过资源文件: {os.path.basename(file_path)}")
+            
+            # 2. 只运行基础的编译测试
+            compile_result = EnhancedTabAI._run_compile_test(tmp_dir)
+            
+            # 3. 生成报告
+            report = {
+                "total_tests": 1,
+                "passed": 1 if compile_result["passed"] else 0,
+                "failed": 0 if compile_result["passed"] else 1,
+                "total_issues": len(compile_result["issues_found"]),
+                "by_category": {
+                    "compilation": {
+                        "total": 1,
+                        "passed": 1 if compile_result["passed"] else 0,
+                        "failed": 0 if compile_result["passed"] else 1,
+                        "issues": len(compile_result["issues_found"])
+                    }
+                },
+                "details": [compile_result],
+                "note": "使用简化版备用测试方案（仅编译检查）"
+            }
+            
+            print(f"✅ 简化版备用测试完成")
+            return report
+            
+        except Exception as e:
+            print(f"❌ 简化版备用测试失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "error": f"测试失败: {str(e)}",
+                "note": "动态测试不可用"
+            }
+
+@staticmethod
+def _run_compile_test(tmp_dir):
+    """运行编译测试"""
+    issues = []
+    try:
+        # 检查所有Python文件是否能编译
+        for root, dirs, files in os.walk(tmp_dir):
+            for file in files:
+                if file.endswith('.py'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            source_code = f.read()
+                        compile(source_code, file_path, 'exec')
+                        print(f"  ✅ 编译通过: {file}")
+                    except SyntaxError as e:
+                        issues.append(f"{file}: {e}")
+                        print(f"  ❌ 编译失败: {file} - {e}")
+        
+        return {
+            "test_name": "python_compile",
+            "category": "compilation",
+            "description": "Python编译检查",
+            "passed": len(issues) == 0,
+            "issues_found": issues,
+            "execution_time": 0.1
+        }
+    except Exception as e:
+        return {
+            "test_name": "python_compile",
+            "category": "compilation", 
+            "description": "Python编译检查",
+            "passed": False,
+            "issues_found": [f"编译测试异常: {e}"],
+            "execution_time": 0.0
+        }

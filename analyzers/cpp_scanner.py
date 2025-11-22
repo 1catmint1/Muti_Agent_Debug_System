@@ -240,7 +240,7 @@ class CppScanner(BaseScanner):
         return result
 
     def check_compilation(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
-        """编译检查（ScannerAgent 调用）"""
+        """编译检查（ScannerAgent 调用）+ 动态检测"""
         print(f"[CppScanner] check_compilation 被调用")
 
         if config:
@@ -282,7 +282,14 @@ class CppScanner(BaseScanner):
                 results["errors"].extend(compile_result.get("errors", []))
 
         print(f"[CppScanner] 编译检查完成: {results['success']}/{results['files_checked']} 通过")
-
+        # 添加新的动态检测
+        try:
+            from .dynamic_detector import CppDynamicDetector
+            detector = CppDynamicDetector(self.files)
+            dynamic_result = detector.detect_all()
+            results["dynamic_detection"] = dynamic_result
+        except Exception as e:
+            results["dynamic_detection_error"] = str(e)
         return results
 
     def _find_compiler(self) -> str:

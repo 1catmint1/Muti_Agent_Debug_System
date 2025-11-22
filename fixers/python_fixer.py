@@ -301,35 +301,31 @@ class PythonFixer(BaseFixer):
             if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
                 reference_code = user_request[start_idx + len(start_tag):end_idx].strip()
 
+        # 🔥 裁剪过长的代码，防止 OOM
+        MAX_CHARS = 6000
+        if len(original_content) > MAX_CHARS:
+            truncated_content = original_content[:MAX_CHARS] + "\n\n# ... (代码过长，仅显示前 6000 字符) ..."
+        else:
+            truncated_content = original_content
+
+        # DebugBench 逻辑保持不变
         if debugbench_mode and reference_code:
             strict_hint = (
                 "【重要】只输出一个带文件名的 python 代码块，不要任何说明文字、不要 diff。"
                 if force_code_block_only else
                 "如果可能，只输出一个带文件名的 python 代码块；不要输出 diff 或解释。"
             )
-
-            logic_issues = self._analyze_logic_diff_v2(original_content, reference_code)
-            logic_report = "\n".join(
-                f"- [{it.get('type', 'LOGIC')}] {it.get('message', '')}"
-                for it in logic_issues
-            )
-            if not logic_report.strip():
-                logic_report = "- [LOGIC_UNKNOWN] 系统未能自动分析逻辑差异，但你的代码必须与正确实现功能一致。"
-
+            logic_issues = self._analyze_logic_diff_v2(truncated_content, reference_code)
+            logic_report = "\n".join(f"- [{it.get('type', 'LOGIC')}] {it.get('message', '')}" for it in logic_issues)
             return (
                 "你正在进行一个名为 DebugBench 的自动 Python 代码修复任务。\n"
-                "系统不直接给出正确代码，而是提供“逻辑差异报告”。你必须依据这些差异修复原始代码。\n\n"
-                "【逻辑差异报告】\n"
-                f"{logic_report}\n"
-                "【逻辑差异结束】\n\n"
-                "【原始代码】\n"
-                f"{original_content}\n"
-                "【原始代码结束】\n\n"
+                f"【逻辑差异报告】\n{logic_report}\n\n"
+                f"【原始代码】\n{truncated_content}\n\n"
                 f"{strict_hint}\n"
-                f"输出格式示例：\n"
-                f"```python {filename}\n<完整代码>\n```\n"
+                f"输出格式示例：\n```python\n<完整代码>\n```\n"
             )
 
+        # === 常规修复 Prompt 构建 ===
         issue_lines = []
         for it in issues:
             issue_lines.append(
@@ -338,9 +334,10 @@ class PythonFixer(BaseFixer):
         issue_text = "\n".join(issue_lines) if issue_lines else "无结构化缺陷条目（可能是外部工具或动态问题）。"
 
         strict_hint = (
-            "【重要】只输出一个带文件名的 python 代码块，不要任何说明文字、不要 diff。"
+            "【重要】只输出一个带文件名的 python 代码块。不要输出 diff、不要输出文件名、不要输出解释文字。"
+            "【注意】确保修改后的代码保持原有的函数签名和类结构，不要删除现有的功能，只修复报错的问题。"  # 🔥 加强约束
             if force_code_block_only else
-            "如果可能，只输出一个带文件名的 python 代码块；不要输出 diff 或解释。"
+            "请直接输出修复后的完整代码块。"
         )
 
         extra = ""
@@ -352,28 +349,64 @@ class PythonFixer(BaseFixer):
             f"【目标文件】{filename}\n"
             f"【检测到的问题】\n{issue_text}\n"
             f"{extra}\n"
-            f"【原始代码开始】\n{original_content}\n【原始代码结束】\n\n"
+            f"【原始代码开始】\n{truncated_content}\n【原始代码结束】\n\n"
             f"{strict_hint}\n"
-            f"代码块格式示例：\n"
-            f"```python {filename}\n<完整代码>\n```\n"
+            f"请直接输出 Python 代码块，格式如下：\n"
+            f"```python\n"
+            f"<完整代码>\n"
+            f"```\n"
         )
 
     def _extract_code_from_response(self, response: str, expected_filename: str) -> str:
-        pattern = r"```(?:python|py)\s+([^\n]+)\s*\n(.*?)```"
-        matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+        # 清理首尾空白
+        response = response.strip()
 
-        for filename, code in matches:
-            filename = filename.strip()
-            if filename in expected_filename or expected_filename in filename:
-                return code.strip()
-
-        pattern = r"```(?:python|py)\s*\n(.*?)```"
-        matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+        # 1. 尝试匹配标准 ```python ... ``` (忽略文件名)
+        pattern_std = r"```(?:python|py).*?\n(.*?)```"
+        matches = re.findall(pattern_std, response, re.DOTALL | re.IGNORECASE)
         if matches:
-            return matches[0].strip()
+            # 选最长的一个块，防止选到短小的示例代码
+            return max(matches, key=len).strip()
+
+        # 2. 尝试匹配通用 ``` ... ```
+        pattern_generic = r"```.*?\n(.*?)```"
+        matches = re.findall(pattern_generic, response, re.DOTALL)
+        if matches:
+            return max(matches, key=len).strip()
+
+        # 3. 🔥 暴力提取：如果 LLM 没写 Markdown 标记，直接按行过滤
+        # 这种情况在本地小模型中非常常见
+        lines = response.split('\n')
+        code_lines = []
+        is_code_started = False
+
+        for line in lines:
+            stripped = line.strip()
+            # 如果遇到 import, class, def, from，认为代码开始了
+            if (stripped.startswith('import ') or
+                    stripped.startswith('from ') or
+                    stripped.startswith('def ') or
+                    stripped.startswith('class ') or
+                    stripped.startswith('@')):
+                is_code_started = True
+
+            # 如果已经开始，或者是空行（保留空行格式），或者是注释
+            if is_code_started:
+                # 简单过滤一下结尾常见的 "Explanation:" 之类的废话
+                if stripped.lower().startswith("explanation:") or stripped.lower().startswith("note:"):
+                    break
+                code_lines.append(line)
+
+        # 只有当提取到了有效的代码行（大于3行）才返回
+        if len(code_lines) > 3:
+            return "\n".join(code_lines).strip()
+
+        # 4. 绝望兜底：如果整个回复包含关键字，直接当做代码返回
+        # 宁可报错也不要返回空，因为返回空会导致 Fixer 认为失败而回滚
+        if "def " in response or "import " in response:
+            return response
 
         return ""
-
     # =========================================================
     #  Python 代码归一化（供 runner 使用，可选）
     # =========================================================

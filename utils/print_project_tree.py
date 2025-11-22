@@ -38,6 +38,6 @@ def print_tree(start_path, max_level=10):
 
 if __name__ == "__main__":
     # ⚠️ 在这里改成你的项目根目录
-    project_path = r"C:\Users\1catmint1\Desktop\link-tools-main"
+    project_path = r"C:\Users\1catmint1\Desktop\Multi_Agent_Debug_System"
 
     print_tree(project_path)

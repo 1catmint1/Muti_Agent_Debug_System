@@ -38,7 +38,28 @@ class BaseScanner(ABC):
 
     def scan_dynamic(self) -> Dict[str, Any]:
         """动态检测（编译/运行检查，可选）"""
-        return {"enabled": False, "results": []}
+        result = {"enabled": True, "results": []}
+        
+        # 尝试使用语言特定的动态检测器
+        try:
+            if self.language == Language.PYTHON:
+                from .dynamic_detector import PythonDynamicDetector
+                detector = PythonDynamicDetector(self.files)
+                result = detector.detect_all()
+            elif self.language == Language.JAVA:
+                from .dynamic_detector import JavaDynamicDetector
+                detector = JavaDynamicDetector(self.files)
+                result = detector.detect_all()
+            elif self.language in (Language.CPP, Language.C):
+                from .dynamic_detector import CppDynamicDetector
+                detector = CppDynamicDetector(self.files)
+                result = detector.detect_all()
+            else:
+                result = {"enabled": False, "reason": f"Unsupported language: {self.language.value}"}
+        except Exception as e:
+            result = {"enabled": False, "error": str(e)}
+        
+        return result
 
     def scan(self, enable_external: bool = True,
              enable_dynamic: bool = True,
